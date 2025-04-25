@@ -329,6 +329,9 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
         self.reload_double_buffer = [[], []]
         self.double_buffer_created = False
 
+        # Need to turn off Offloading for validation steps
+        self.validation = False
+
         # Logic to make offloading load balance across computation
         # for optimal CPU/GPU interconnect usage
         constant = 0
@@ -344,7 +347,13 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
         self.d2h_stream = torch.cuda.Stream()
         self.h2d_stream = torch.cuda.Stream()
 
+    def set_validation(self, flag: bool):
+        self.validation = flag
+
     def tensor_push(self, tensor: torch.Tensor, **kwargs) -> Any:
+
+        if self.validation:
+            return None
 
         torch_stray_tensor = isinstance(
             tensor,
@@ -511,6 +520,10 @@ class AsyncDoubleBufferGroupOffloadHandler(SynchronizedGroupOffloadHandler):
 
     def on_group_commit_forward(self):
         """This function will cause host device synchronization"""
+
+        if self.validation:
+            return
+
         # handle synchronization events
         self.synchronize_on_group_commit_forward(self.current_group)
 

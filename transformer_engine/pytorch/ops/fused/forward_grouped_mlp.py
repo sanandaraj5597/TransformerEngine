@@ -32,7 +32,7 @@ from .._common import (
 )
 
 
-def _pack_nvfp4_amax_list(tensors: list) -> None:
+def _pack_nvfp4_amax_list(tensors: list) -> List[torch.Tensor]:
     """Ensure discrete NVFP4 weight list uses contiguous per-group amax buffers.
 
     The discrete-input grouped GEMM kernels expect a single contiguous device
@@ -47,12 +47,13 @@ def _pack_nvfp4_amax_list(tensors: list) -> None:
         packed_row_amax = torch.cat([amax.view(-1) for amax in row_amaxes], dim=0).contiguous()
         for idx, tensor in enumerate(tensors):
             tensor._amax_rowwise = packed_row_amax[idx : idx + 1]
-    col_amaxes = [getattr(tensor, "_amax_columnwise", None) for tensor in tensors]
-    if all(amax is not None for amax in col_amaxes):
-        packed_col_amax = torch.cat([amax.view(-1) for amax in col_amaxes], dim=0).contiguous()
-        for idx, tensor in enumerate(tensors):
-            tensor._amax_columnwise = packed_col_amax[idx : idx + 1]
+    return row_amaxes
 
+def _unpack_nvfp4_amax_list(tensors: list, discrete_amax: List[torch.Tensor]) -> None:
+    if not tensors:
+        return
+    for idx, row_amax in enumerate(discrete_amax):
+        tensors[idx]._amax_rowwise = row_amax
 
 def _enable_nvfp4_rht_for_group_quantize(quantizer: Quantizer) -> None:
     """Use the graph-safe NVFP4 grouped quantization path.
@@ -363,10 +364,6 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                 else:
                     quantized_fc1_weights.append(weight)
             grouped_fc1_weight = quantized_fc1_weights
-            # NVFP4 discrete-input grouped GEMM requires per-group amax pointers
-            # to be contiguous in device memory.
-            if isinstance(fc1_input_quantizer, NVFP4Quantizer):
-                _pack_nvfp4_amax_list(grouped_fc1_weight)
 
         # Prepare FC2 grouped weight tensor for fused kernels.
         if fc2_op.single_grouped_weight:
@@ -403,7 +400,7 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             # NVFP4 discrete-input grouped GEMM requires per-group amax pointers
             # to be contiguous in device memory.
             if isinstance(fc2_input_quantizer, NVFP4Quantizer):
-                _pack_nvfp4_amax_list(grouped_fc2_weight)
+                legacy_amax_list = _pack_nvfp4_amax_list(grouped_fc2_weight)
 
         # Some wrapper-copy paths may drop grouped storage metadata; enforce defaults.
         if getattr(grouped_fc1_weight, "_with_gemm_swizzled_scales", None) is None and isinstance(
@@ -726,6 +723,9 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
                     fc2_out_grouped,
                     layout="TN",
                 )
+
+                if isinstance(fc2_input_quantizer, NVFP4Quantizer) and not fc2_op.single_grouped_weight:
+                    _unpack_nvfp4_amax_list(grouped_fc2_weight, legacy_amax_list)
             fc2_out = fc2_out_buf
             if fc2_bias_packed is not None:
                 # ``fc2_bias_packed`` has shape (n, num_groups) with stride (1, n)

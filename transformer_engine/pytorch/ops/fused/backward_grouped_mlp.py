@@ -39,7 +39,9 @@ from ...module.base import _2X_ACC_WGRAD
 from ...triton.grouped_dbias_dscales import compute_grouped_dbias_dscales
 
 
-def _pack_nvfp4_amax_list(tensors: list) -> None:
+amax_w_col = None
+
+def _pack_nvfp4_amax_list(tensors: list) -> List[torch.Tensor]:
     """Ensure discrete NVFP4 weight list uses contiguous per-group amax buffers.
 
     The discrete-input grouped GEMM kernels expect a single contiguous device
@@ -49,17 +51,18 @@ def _pack_nvfp4_amax_list(tensors: list) -> None:
     """
     if not tensors:
         return
-    row_amaxes = [getattr(tensor, "_amax_rowwise", None) for tensor in tensors]
-    if all(amax is not None for amax in row_amaxes):
-        packed_row_amax = torch.cat([amax.view(-1) for amax in row_amaxes], dim=0).contiguous()
-        for idx, tensor in enumerate(tensors):
-            tensor._amax_rowwise = packed_row_amax[idx : idx + 1]
     col_amaxes = [getattr(tensor, "_amax_columnwise", None) for tensor in tensors]
     if all(amax is not None for amax in col_amaxes):
         packed_col_amax = torch.cat([amax.view(-1) for amax in col_amaxes], dim=0).contiguous()
         for idx, tensor in enumerate(tensors):
             tensor._amax_columnwise = packed_col_amax[idx : idx + 1]
+    return col_amaxes
 
+def _unpack_nvfp4_amax_list(tensors: list, discrete_amax: List[torch.Tensor]) -> None:
+    if not tensors:
+        return
+    for idx, col_amax in enumerate(discrete_amax):
+        tensors[idx]._amax_columnwise = col_amax
 
 def _mark_with_gemm_swizzled_scales(tensors: Any) -> None:
     """Mark tensors whose scale buffers are already in GEMM-swizzled layout."""
@@ -161,16 +164,22 @@ def _nvfp4_amax(tensors: Any, *, columnwise: bool) -> torch.Tensor:
     grouped_attr = "columnwise_amax" if columnwise else "amax"
     tensor_attr = "_amax_columnwise" if columnwise else "_amax_rowwise"
 
+    global amax_w_col
+
     if hasattr(tensors, grouped_attr):
         amax = getattr(tensors, grouped_attr)
         if amax is None:
             raise RuntimeError(f"NVFP4 GroupedTensor is missing {grouped_attr}.")
         return amax.view(-1)
 
+    if amax_w_col is None:
+        amax_w_col = torch.zeros(len(tensors), dtype=torch.float32, device = tensors[0].device)
     amaxes = [getattr(tensor, tensor_attr, None) for tensor in tensors]
     if any(amax is None for amax in amaxes):
         raise RuntimeError(f"NVFP4 tensor list is missing {tensor_attr}.")
-    return torch.cat([amax.view(-1) for amax in amaxes], dim=0)
+    torch.cat([amax.view(-1) for amax in amaxes], dim=0, out=amax_w_col)
+    
+    return amax_w_col
 
 
 def _get_first_grad_output_quantizer(ctx: OperationContext):
@@ -1044,7 +1053,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 # NVFP4 dgrad uses the generic grouped GEMM wrapper since the
                 # cuDNN quant wrapper expects FP8 inputs and packed scales.
                 if not fc1_op.single_grouped_weight:
-                    _pack_nvfp4_amax_list(grouped_fc1_weight)
+                    legacy_amax = _pack_nvfp4_amax_list(grouped_fc1_weight)
                 _mark_with_gemm_swizzled_scales(grouped_fc1_weight)
                 _mark_with_gemm_swizzled_scales(grouped_fc1_dy)
                 grad_input = torch.empty(in_shape, dtype=dtype, device=device)
@@ -1078,6 +1087,8 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         grouped_grad_input,
                         layout="NN",
                     )
+                    if not fc1_op.single_grouped_weight:
+                        _unpack_nvfp4_amax_list(grouped_fc1_weight, legacy_amax)
             else:
                 fc1_dgrad_a_data = fc2_dgrad_kernel_out["d_row_tensor"]
                 fc1_dgrad_a_scales = fc2_dgrad_kernel_out["sfd_row_tensor"]
